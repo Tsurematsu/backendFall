@@ -13,7 +13,7 @@ const COLLECTION_NAME = 'personas';
 //
 // ─────────────────────────────────────────────────────────────────────────────
 
-const uri = "mongodb://atlas-sql-69135898220f000c4f972a52-zvfuz.a.query.mongodb.net/testDB?ssl=true&authSource=admin";
+const uri = process.env.MONGODB_URI;
 if (!uri) throw new Error('Falta MONGODB_URI en las variables de entorno');
 
 let clientPromise;
