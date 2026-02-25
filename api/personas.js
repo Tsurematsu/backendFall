@@ -21,6 +21,12 @@ import { Pool } from 'pg';
 //
 // ─────────────────────────────────────────────────────────────────────────────
 
+// ─── CONTRASEÑA DE BORRADO ────────────────────────────────────────────────────
+//  Cámbiala aquí o agrégala al .env como DELETE_PASSWORD=tu_clave_secreta
+//  ⚠ Mover a variable de entorno antes de subir a producción.
+
+const DELETE_PASSWORD = process.env.DELETE_PASSWORD || 'admin1234';
+
 // ─── CONFIGURACIÓN EXPLÍCITA ──────────────────────────────────────────────────
 //  Cambia estos valores o (mejor) usa las variables de entorno de arriba.
 
@@ -97,7 +103,7 @@ function toLeaderboardRow(row, pos) {
 
 function handleCors(req, res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, OPTIONS');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
   if (req.method === 'OPTIONS') {
     res.status(204).end();
@@ -238,6 +244,28 @@ export default async function handler(req, res) {
       );
       const pos = Number(countRows[0].count) + 1;
       return res.status(200).json({ success: true, data: toLeaderboardRow(persona, pos) });
+    }
+
+    // ── DELETE /api/personas/:id ─────────────────────────────────────────────
+    //  Requiere { password: "..." } en el body para autorizar el borrado.
+    if (method === 'DELETE' && id) {
+      const { password } = body || {};
+
+      if (!password) {
+        return res.status(400).json({ success: false, error: 'Se requiere el campo password' });
+      }
+      if (password !== DELETE_PASSWORD) {
+        return res.status(401).json({ success: false, error: 'Contraseña incorrecta' });
+      }
+
+      const { rows } = await client.query(
+        'DELETE FROM personas WHERE id = $1 RETURNING *',
+        [id]
+      );
+      if (!rows.length) {
+        return res.status(404).json({ success: false, error: 'Persona no encontrada' });
+      }
+      return res.status(200).json({ success: true, data: { deleted: rows[0] } });
     }
 
     return res.status(405).json({ success: false, error: 'Ruta no encontrada' });
