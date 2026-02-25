@@ -1,5 +1,5 @@
 import { Pool } from 'pg';
-
+// Este e sun function para el entorno de vercel
 // ─── VARIABLES DE ENTORNO REQUERIDAS ─────────────────────────────────────────
 //
 //  Agrega estas variables en:
@@ -67,9 +67,15 @@ async function ensureTable(client) {
       carrera    VARCHAR(255) NOT NULL,
       edad       INTEGER      NOT NULL,
       total      INTEGER      NOT NULL DEFAULT 0,
+      razon      TEXT,
       creado_en  TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
       actualizado_en TIMESTAMPTZ
     );
+  `);
+
+  // Agrega la columna razon si la tabla ya existía sin ella (migración segura)
+  await client.query(`
+    ALTER TABLE personas ADD COLUMN IF NOT EXISTS razon TEXT;
   `);
 
   // Índice para ordenar por total rápidamente
@@ -95,6 +101,7 @@ function toLeaderboardRow(row, pos) {
     carrera: row.carrera,
     edad:    row.edad,
     total:   row.total,
+    razon:   row.razon ?? null,
     medal:   getMedal(pos),
   };
 }
@@ -159,20 +166,22 @@ export default async function handler(req, res) {
 
     // ── POST /api/personas ───────────────────────────────────────────────────
     //  Crea la persona si no existe; si ya existe, incrementa total en 1.
+    //  El campo razon es opcional; si se envía, se actualiza en cada llamada.
     if (method === 'POST' && !id) {
-      const { nombre, edad, carrera } = body || {};
+      const { nombre, edad, carrera, razon } = body || {};
       if (!nombre || !edad || !carrera) {
         return res.status(400).json({ success: false, error: 'nombre, edad y carrera son requeridos' });
       }
 
       const { rows } = await client.query(
-        `INSERT INTO personas (nombre, edad, carrera, total)
-         VALUES ($1, $2, $3, 1)
+        `INSERT INTO personas (nombre, edad, carrera, total, razon)
+         VALUES ($1, $2, $3, 1, $4)
          ON CONFLICT (nombre) DO UPDATE
            SET total = personas.total + 1,
+               razon = COALESCE($4, personas.razon),
                actualizado_en = NOW()
          RETURNING *`,
-        [nombre, Number(edad), carrera]
+        [nombre, Number(edad), carrera, razon ?? null]
       );
       const persona = rows[0];
       const { rows: countRows } = await client.query(
@@ -185,7 +194,7 @@ export default async function handler(req, res) {
 
     // ── PUT /api/personas/:id ────────────────────────────────────────────────
     if (method === 'PUT' && id && sub !== 'total') {
-      const { nombre, edad, carrera, total } = body || {};
+      const { nombre, edad, carrera, total, razon } = body || {};
 
       const setClauses = [];
       const values     = [];
@@ -195,6 +204,7 @@ export default async function handler(req, res) {
       if (edad    !== undefined) { setClauses.push(`edad = $${idx++}`);    values.push(Number(edad)); }
       if (carrera !== undefined) { setClauses.push(`carrera = $${idx++}`); values.push(carrera); }
       if (total   !== undefined) { setClauses.push(`total = $${idx++}`);   values.push(Number(total)); }
+      if (razon   !== undefined) { setClauses.push(`razon = $${idx++}`);   values.push(razon); }
 
       if (!setClauses.length) {
         return res.status(400).json({ success: false, error: 'No se enviaron campos para actualizar' });
@@ -220,8 +230,9 @@ export default async function handler(req, res) {
     }
 
     // ── PUT /api/personas/:id/total ──────────────────────────────────────────
+    //  El campo razon es opcional; si se envía, se actualiza junto al total.
     if (method === 'PUT' && id && sub === 'total') {
-      const { accion } = body || {};
+      const { accion, razon } = body || {};
       if (!['incrementar', 'decrementar'].includes(accion)) {
         return res.status(400).json({ success: false, error: 'accion debe ser "incrementar" o "decrementar"' });
       }
@@ -229,10 +240,12 @@ export default async function handler(req, res) {
       const delta = accion === 'incrementar' ? 1 : -1;
       const { rows } = await client.query(
         `UPDATE personas
-         SET total = total + $1, actualizado_en = NOW()
-         WHERE id = $2
+         SET total = total + $1,
+             razon = COALESCE($2, razon),
+             actualizado_en = NOW()
+         WHERE id = $3
          RETURNING *`,
-        [delta, id]
+        [delta, razon ?? null, id]
       );
       if (!rows.length) {
         return res.status(404).json({ success: false, error: 'Persona no encontrada' });
