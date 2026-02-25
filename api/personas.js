@@ -1,29 +1,96 @@
-import { MongoClient, ObjectId } from 'mongodb';
+import { Pool } from 'pg';
 
-// ─── CONFIGURACIÓN DE BASE DE DATOS ──────────────────────────────────────────
+// ─── VARIABLES DE ENTORNO REQUERIDAS ─────────────────────────────────────────
 //
-//  Agrega esta variable en:
+//  Agrega estas variables en:
 //  · Local:  archivo .env.local
 //  · Vercel: Settings → Environment Variables
 //
-//  MONGODB_URI=mongodb://atlas-sql-69135898220f000c4f972a52-zvfuz.a.query.mongodb.net/testDB?ssl=true&authSource=admin
+//  Opción A — cadena de conexión única:
+//    POSTGRES_URL=postgresql://usuario:contraseña@host:5432/nombre_db
 //
-const DB_NAME         = 'testDB';
-const COLLECTION_NAME = 'personas';
+//  Opción B — variables individuales (si no usas POSTGRES_URL):
+//    POSTGRES_HOST=localhost
+//    POSTGRES_PORT=5432
+//    POSTGRES_DB=testDB
+//    POSTGRES_USER=daniel_db_user
+//    POSTGRES_PASSWORD=tu_contraseña_aqui
+//    POSTGRES_SSL=true          ← pon "false" si es local sin SSL
+//
+//  ⚠ Nunca subas valores reales al repositorio. Usa siempre variables de entorno.
 //
 // ─────────────────────────────────────────────────────────────────────────────
 
-const uri = "mongodb+srv://daniel20802_db_user:N7DzSYT9b7nockxx@cluster0.8lrfr0o.mongodb.net/testDB?retryWrites=true&w=majority&appName=Cluster0";
-if (!uri) throw new Error('Falta MONGODB_URI en las variables de entorno');
+// ─── CONFIGURACIÓN EXPLÍCITA ──────────────────────────────────────────────────
+//  Cambia estos valores o (mejor) usa las variables de entorno de arriba.
 
-let clientPromise;
-if (process.env.NODE_ENV === 'development') {
-  if (!global._mongoClientPromise) {
-    global._mongoClientPromise = new MongoClient(uri).connect();
+const DB_CONFIG = {
+  connectionString: process.env.POSTGRES_URL, // tiene prioridad si existe
+  host:     process.env.POSTGRES_HOST     || 'localhost',
+  port:     Number(process.env.POSTGRES_PORT)  || 5432,
+  database: process.env.POSTGRES_DB       || 'testDB',
+  user:     process.env.POSTGRES_USER     || 'daniel_db_user',
+  password: process.env.POSTGRES_PASSWORD || 'CAMBIA_ESTA_CONTRASEÑA',
+  ssl:      process.env.POSTGRES_SSL === 'false'
+              ? false
+              : { rejectUnauthorized: false }, // true por defecto (Vercel/Neon/Supabase)
+};
+
+// ─── POOL DE CONEXIONES ───────────────────────────────────────────────────────
+
+let pool;
+function getPool() {
+  if (!pool) {
+    pool = new Pool(
+      DB_CONFIG.connectionString
+        ? { connectionString: DB_CONFIG.connectionString, ssl: DB_CONFIG.ssl }
+        : DB_CONFIG
+    );
   }
-  clientPromise = global._mongoClientPromise;
-} else {
-  clientPromise = new MongoClient(uri).connect();
+  return pool;
+}
+
+// ─── INICIALIZACIÓN DE TABLA ──────────────────────────────────────────────────
+//  Se ejecuta en cada cold-start; si la tabla ya existe, no hace nada.
+
+async function ensureTable(client) {
+  await client.query(`
+    CREATE TABLE IF NOT EXISTS personas (
+      id         SERIAL PRIMARY KEY,
+      nombre     VARCHAR(255) NOT NULL UNIQUE,
+      carrera    VARCHAR(255) NOT NULL,
+      edad       INTEGER      NOT NULL,
+      total      INTEGER      NOT NULL DEFAULT 0,
+      creado_en  TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+      actualizado_en TIMESTAMPTZ
+    );
+  `);
+
+  // Índice para ordenar por total rápidamente
+  await client.query(`
+    CREATE INDEX IF NOT EXISTS idx_personas_total ON personas (total DESC);
+  `);
+}
+
+// ─── HELPERS ──────────────────────────────────────────────────────────────────
+
+function getMedal(pos) {
+  if (pos === 1) return 'gold';
+  if (pos === 2) return 'silver';
+  if (pos === 3) return 'bronze';
+  return '';
+}
+
+function toLeaderboardRow(row, pos) {
+  return {
+    pos,
+    id:      row.id,
+    nombre:  row.nombre,
+    carrera: row.carrera,
+    edad:    row.edad,
+    total:   row.total,
+    medal:   getMedal(pos),
+  };
 }
 
 // ─── CORS ─────────────────────────────────────────────────────────────────────
@@ -39,148 +106,146 @@ function handleCors(req, res) {
   return false;
 }
 
-// ─── HELPERS ──────────────────────────────────────────────────────────────────
-
-/**
- * Asigna medalla según posición
- * @param {number} pos
- * @returns {string}
- */
-function getMedal(pos) {
-  if (pos === 1) return 'gold';
-  if (pos === 2) return 'silver';
-  if (pos === 3) return 'bronze';
-  return '';
-}
-
-/**
- * Convierte documento MongoDB → LeaderboardRow
- * @typedef {{ pos: number, nombre: string, carrera: string, edad: number, total: number, medal: string }} LeaderboardRow
- * @param {object} doc
- * @param {number} pos
- * @returns {LeaderboardRow}
- */
-function toLeaderboardRow(doc, pos) {
-  return {
-    pos,
-    nombre:  doc.nombre,
-    carrera: doc.carrera,
-    edad:    doc.edad,
-    total:   doc.total,
-    medal:   getMedal(pos),
-  };
-}
-
 // ─── HANDLER PRINCIPAL ────────────────────────────────────────────────────────
 
 export default async function handler(req, res) {
   if (handleCors(req, res)) return;
 
-  const client     = await clientPromise;
-  const collection = client.db(DB_NAME).collection(COLLECTION_NAME);
+  const client = await getPool().connect();
 
-  const { url, method, body } = req;
+  try {
+    // Garantiza que la tabla exista antes de cualquier operación
+    await ensureTable(client);
 
-  const match = url.replace(/\?.*$/, '').match(/\/api\/personas\/?([^/]*)?\/?([^/]*)?$/);
-  const id  = match?.[1] || null;
-  const sub = match?.[2] || null;
+    const { method, body } = req;
+    const url = req.url.replace(/\?.*$/, '');
 
-  // ── GET /api/personas ──────────────────────────────────────────────────────
-  if (method === 'GET' && !id) {
-    try {
-      const docs        = await collection.find({}).sort({ total: -1 }).toArray();
-      const leaderboard = docs.map((doc, i) => toLeaderboardRow(doc, i + 1));
+    const match = url.match(/\/api\/personas\/?([^/]*)?\/?([^/]*)?$/);
+    const id  = match?.[1] || null;
+    const sub = match?.[2] || null;
+
+    // ── GET /api/personas ────────────────────────────────────────────────────
+    if (method === 'GET' && !id) {
+      const { rows } = await client.query(
+        'SELECT * FROM personas ORDER BY total DESC'
+      );
+      const leaderboard = rows.map((row, i) => toLeaderboardRow(row, i + 1));
       return res.status(200).json({ success: true, data: leaderboard });
-    } catch (e) {
-      return res.status(500).json({ success: false, error: e.message });
     }
-  }
 
-  // ── GET /api/personas/:id ──────────────────────────────────────────────────
-  if (method === 'GET' && id) {
-    if (!ObjectId.isValid(id)) return res.status(400).json({ success: false, error: 'ID inválido' });
-    try {
-      const persona = await collection.findOne({ _id: new ObjectId(id) });
-      if (!persona) return res.status(404).json({ success: false, error: 'Persona no encontrada' });
-      const pos = (await collection.countDocuments({ total: { $gt: persona.total } })) + 1;
+    // ── GET /api/personas/:id ────────────────────────────────────────────────
+    if (method === 'GET' && id) {
+      const { rows } = await client.query(
+        'SELECT * FROM personas WHERE id = $1',
+        [id]
+      );
+      if (!rows.length) {
+        return res.status(404).json({ success: false, error: 'Persona no encontrada' });
+      }
+      const persona = rows[0];
+      const { rows: countRows } = await client.query(
+        'SELECT COUNT(*) FROM personas WHERE total > $1',
+        [persona.total]
+      );
+      const pos = Number(countRows[0].count) + 1;
       return res.status(200).json({ success: true, data: toLeaderboardRow(persona, pos) });
-    } catch (e) {
-      return res.status(500).json({ success: false, error: e.message });
     }
-  }
 
-  // ── POST /api/personas ─────────────────────────────────────────────────────
-  if (method === 'POST' && !id) {
-    const { nombre, edad, carrera } = body || {};
-    if (!nombre || !edad || !carrera) {
-      return res.status(400).json({ success: false, error: 'nombre, edad y carrera son requeridos' });
-    }
-    try {
-      const updated = await collection.findOneAndUpdate(
-        { nombre },
-        {
-          $inc: { total: 1 },
-          $setOnInsert: { edad: Number(edad), carrera, creadoEn: new Date() },
-        },
-        { upsert: true, returnDocument: 'after' }
+    // ── POST /api/personas ───────────────────────────────────────────────────
+    //  Crea la persona si no existe; si ya existe, incrementa total en 1.
+    if (method === 'POST' && !id) {
+      const { nombre, edad, carrera } = body || {};
+      if (!nombre || !edad || !carrera) {
+        return res.status(400).json({ success: false, error: 'nombre, edad y carrera son requeridos' });
+      }
+
+      const { rows } = await client.query(
+        `INSERT INTO personas (nombre, edad, carrera, total)
+         VALUES ($1, $2, $3, 1)
+         ON CONFLICT (nombre) DO UPDATE
+           SET total = personas.total + 1,
+               actualizado_en = NOW()
+         RETURNING *`,
+        [nombre, Number(edad), carrera]
       );
-      const pos = (await collection.countDocuments({ total: { $gt: updated.total } })) + 1;
-      return res.status(200).json({ success: true, data: toLeaderboardRow(updated, pos) });
-    } catch (e) {
-      return res.status(500).json({ success: false, error: e.message });
-    }
-  }
-
-  // ── PUT /api/personas/:id ──────────────────────────────────────────────────
-  if (method === 'PUT' && id && !sub) {
-    if (!ObjectId.isValid(id)) return res.status(400).json({ success: false, error: 'ID inválido' });
-    const { nombre, edad, carrera, total } = body || {};
-    const update = {};
-    if (nombre  !== undefined) update.nombre  = nombre;
-    if (edad    !== undefined) update.edad    = Number(edad);
-    if (carrera !== undefined) update.carrera = carrera;
-    if (total   !== undefined) update.total   = Number(total);
-    if (Object.keys(update).length === 0) {
-      return res.status(400).json({ success: false, error: 'No se enviaron campos para actualizar' });
-    }
-    update.actualizadoEn = new Date();
-    try {
-      const updated = await collection.findOneAndUpdate(
-        { _id: new ObjectId(id) },
-        { $set: update },
-        { returnDocument: 'after' }
+      const persona = rows[0];
+      const { rows: countRows } = await client.query(
+        'SELECT COUNT(*) FROM personas WHERE total > $1',
+        [persona.total]
       );
-      if (!updated) return res.status(404).json({ success: false, error: 'Persona no encontrada' });
-      const pos = (await collection.countDocuments({ total: { $gt: updated.total } })) + 1;
-      return res.status(200).json({ success: true, data: toLeaderboardRow(updated, pos) });
-    } catch (e) {
-      return res.status(500).json({ success: false, error: e.message });
+      const pos = Number(countRows[0].count) + 1;
+      return res.status(200).json({ success: true, data: toLeaderboardRow(persona, pos) });
     }
-  }
 
-  // ── PUT /api/personas/:id/total ────────────────────────────────────────────
-  if (method === 'PUT' && id && sub === 'total') {
-    if (!ObjectId.isValid(id)) return res.status(400).json({ success: false, error: 'ID inválido' });
-    const { accion } = body || {};
-    if (!['incrementar', 'decrementar'].includes(accion)) {
-      return res.status(400).json({ success: false, error: 'accion debe ser "incrementar" o "decrementar"' });
-    }
-    try {
-      const updated = await collection.findOneAndUpdate(
-        { _id: new ObjectId(id) },
-        {
-          $inc: { total: accion === 'incrementar' ? 1 : -1 },
-          $set: { actualizadoEn: new Date() },
-        },
-        { returnDocument: 'after' }
+    // ── PUT /api/personas/:id ────────────────────────────────────────────────
+    if (method === 'PUT' && id && sub !== 'total') {
+      const { nombre, edad, carrera, total } = body || {};
+
+      const setClauses = [];
+      const values     = [];
+      let   idx        = 1;
+
+      if (nombre  !== undefined) { setClauses.push(`nombre = $${idx++}`);  values.push(nombre); }
+      if (edad    !== undefined) { setClauses.push(`edad = $${idx++}`);    values.push(Number(edad)); }
+      if (carrera !== undefined) { setClauses.push(`carrera = $${idx++}`); values.push(carrera); }
+      if (total   !== undefined) { setClauses.push(`total = $${idx++}`);   values.push(Number(total)); }
+
+      if (!setClauses.length) {
+        return res.status(400).json({ success: false, error: 'No se enviaron campos para actualizar' });
+      }
+
+      setClauses.push(`actualizado_en = NOW()`);
+      values.push(id);
+
+      const { rows } = await client.query(
+        `UPDATE personas SET ${setClauses.join(', ')} WHERE id = $${idx} RETURNING *`,
+        values
       );
-      if (!updated) return res.status(404).json({ success: false, error: 'Persona no encontrada' });
-      const pos = (await collection.countDocuments({ total: { $gt: updated.total } })) + 1;
-      return res.status(200).json({ success: true, data: toLeaderboardRow(updated, pos) });
-    } catch (e) {
-      return res.status(500).json({ success: false, error: e.message });
+      if (!rows.length) {
+        return res.status(404).json({ success: false, error: 'Persona no encontrada' });
+      }
+      const persona = rows[0];
+      const { rows: countRows } = await client.query(
+        'SELECT COUNT(*) FROM personas WHERE total > $1',
+        [persona.total]
+      );
+      const pos = Number(countRows[0].count) + 1;
+      return res.status(200).json({ success: true, data: toLeaderboardRow(persona, pos) });
     }
-  }
 
-  return res.status(405).json({ success: false, error: 'Ruta no encontrada' });
+    // ── PUT /api/personas/:id/total ──────────────────────────────────────────
+    if (method === 'PUT' && id && sub === 'total') {
+      const { accion } = body || {};
+      if (!['incrementar', 'decrementar'].includes(accion)) {
+        return res.status(400).json({ success: false, error: 'accion debe ser "incrementar" o "decrementar"' });
+      }
+
+      const delta = accion === 'incrementar' ? 1 : -1;
+      const { rows } = await client.query(
+        `UPDATE personas
+         SET total = total + $1, actualizado_en = NOW()
+         WHERE id = $2
+         RETURNING *`,
+        [delta, id]
+      );
+      if (!rows.length) {
+        return res.status(404).json({ success: false, error: 'Persona no encontrada' });
+      }
+      const persona = rows[0];
+      const { rows: countRows } = await client.query(
+        'SELECT COUNT(*) FROM personas WHERE total > $1',
+        [persona.total]
+      );
+      const pos = Number(countRows[0].count) + 1;
+      return res.status(200).json({ success: true, data: toLeaderboardRow(persona, pos) });
+    }
+
+    return res.status(405).json({ success: false, error: 'Ruta no encontrada' });
+
+  } catch (e) {
+    console.error('[personas API]', e);
+    return res.status(500).json({ success: false, error: e.message });
+  } finally {
+    client.release();
+  }
 }
