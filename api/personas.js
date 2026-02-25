@@ -13,7 +13,7 @@ const COLLECTION_NAME = 'personas';
 //
 // ─────────────────────────────────────────────────────────────────────────────
 
-const uri = process.env.MONGODB_URI;
+const uri = "mongodb+srv://daniel20802_db_user:N7DzSYT9b7nockxx@cluster0.8lrfr0o.mongodb.net/testDB?retryWrites=true&w=majority&appName=Cluster0";
 if (!uri) throw new Error('Falta MONGODB_URI en las variables de entorno');
 
 let clientPromise;
