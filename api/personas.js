@@ -78,6 +78,14 @@ async function ensureTable(client) {
     ALTER TABLE personas ADD COLUMN IF NOT EXISTS razon TEXT;
   `);
 
+  // Índice único funcional sobre LOWER(nombre) para evitar duplicados por
+  // diferencias de mayúsculas/minúsculas que el UNIQUE estándar no detecta.
+  // Si la tabla ya tiene filas con variantes del mismo nombre normalizadas,
+  // este índice fallará hasta que se limpien manualmente esas filas.
+  await client.query(`
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_personas_nombre_lower ON personas (LOWER(nombre));
+  `);
+
   // Índice para ordenar por total rápidamente
   await client.query(`
     CREATE INDEX IF NOT EXISTS idx_personas_total ON personas (total DESC);
@@ -85,6 +93,14 @@ async function ensureTable(client) {
 }
 
 // ─── HELPERS ──────────────────────────────────────────────────────────────────
+
+/**
+ * Normaliza el nombre: elimina espacios extremos y convierte a minúsculas.
+ * Es el determinante único para identificar a una persona en el sistema.
+ */
+function normalizarNombre(nombre) {
+  return nombre.trim().toLowerCase();
+}
 
 function getMedal(pos) {
   if (pos === 1) return 'gold';
@@ -165,23 +181,31 @@ export default async function handler(req, res) {
     }
 
     // ── POST /api/personas ───────────────────────────────────────────────────
-    //  Crea la persona si no existe; si ya existe, incrementa total en 1.
-    //  El campo razon es opcional; si se envía, se actualiza en cada llamada.
+    //  El nombre se normaliza (trim + lowercase) antes de cualquier operación.
+    //  Si no existe se crea con total: 1; si ya existe solo incrementa el total.
+    //  - edad y carrera se guardan únicamente en el insert inicial; se ignoran en conflicto.
+    //  - razon se concatena al valor existente separado por ", " en cada llamada.
     if (method === 'POST' && !id) {
       const { nombre, edad, carrera, razon } = body || {};
       if (!nombre || !edad || !carrera) {
         return res.status(400).json({ success: false, error: 'nombre, edad y carrera son requeridos' });
       }
 
+      const nombreNormalizado = normalizarNombre(nombre);
+
       const { rows } = await client.query(
         `INSERT INTO personas (nombre, edad, carrera, total, razon)
          VALUES ($1, $2, $3, 1, $4)
          ON CONFLICT (nombre) DO UPDATE
-           SET total = personas.total + 1,
-               razon = COALESCE($4, personas.razon),
+           SET total          = personas.total + 1,
+               razon          = CASE
+                                  WHEN $4 IS NULL       THEN personas.razon
+                                  WHEN personas.razon IS NULL THEN $4
+                                  ELSE personas.razon || ', ' || $4
+                                END,
                actualizado_en = NOW()
          RETURNING *`,
-        [nombre, Number(edad), carrera, razon ?? null]
+        [nombreNormalizado, Number(edad), carrera, razon ?? null]
       );
       const persona = rows[0];
       const { rows: countRows } = await client.query(
@@ -193,18 +217,21 @@ export default async function handler(req, res) {
     }
 
     // ── PUT /api/personas/:id ────────────────────────────────────────────────
+    //  Solo permite actualizar razon (se concatena) y total.
+    //  nombre, edad y carrera se ignoran en este endpoint.
     if (method === 'PUT' && id && sub !== 'total') {
-      const { nombre, edad, carrera, total, razon } = body || {};
+      const { total, razon } = body || {};
 
       const setClauses = [];
       const values     = [];
       let   idx        = 1;
 
-      if (nombre  !== undefined) { setClauses.push(`nombre = $${idx++}`);  values.push(nombre); }
-      if (edad    !== undefined) { setClauses.push(`edad = $${idx++}`);    values.push(Number(edad)); }
-      if (carrera !== undefined) { setClauses.push(`carrera = $${idx++}`); values.push(carrera); }
-      if (total   !== undefined) { setClauses.push(`total = $${idx++}`);   values.push(Number(total)); }
-      if (razon   !== undefined) { setClauses.push(`razon = $${idx++}`);   values.push(razon); }
+      if (total !== undefined) { setClauses.push(`total = $${idx++}`); values.push(Number(total)); }
+      if (razon !== undefined) {
+        setClauses.push(`razon = CASE WHEN razon IS NULL THEN $${idx} ELSE razon || ', ' || $${idx} END`);
+        idx++;
+        values.push(razon);
+      }
 
       if (!setClauses.length) {
         return res.status(400).json({ success: false, error: 'No se enviaron campos para actualizar' });
@@ -230,7 +257,8 @@ export default async function handler(req, res) {
     }
 
     // ── PUT /api/personas/:id/total ──────────────────────────────────────────
-    //  El campo razon es opcional; si se envía, se actualiza junto al total.
+    //  Incrementa o decrementa el total en 1.
+    //  razon es opcional; si se envía, se concatena al valor existente.
     if (method === 'PUT' && id && sub === 'total') {
       const { accion, razon } = body || {};
       if (!['incrementar', 'decrementar'].includes(accion)) {
@@ -240,8 +268,12 @@ export default async function handler(req, res) {
       const delta = accion === 'incrementar' ? 1 : -1;
       const { rows } = await client.query(
         `UPDATE personas
-         SET total = total + $1,
-             razon = COALESCE($2, razon),
+         SET total          = total + $1,
+             razon          = CASE
+                                WHEN $2 IS NULL            THEN razon
+                                WHEN razon IS NULL         THEN $2
+                                ELSE razon || ', ' || $2
+                              END,
              actualizado_en = NOW()
          WHERE id = $3
          RETURNING *`,
